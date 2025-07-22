@@ -1,5 +1,5 @@
 [package]
-name = "rust_lra_calculator"
+name = "LRA-Calculator-Rust"
 version = "0.1.0"
 edition = "2021"
 

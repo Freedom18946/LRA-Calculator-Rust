@@ -21,7 +21,7 @@
 1.  **克隆仓库** (如果您从 git 获取):
     ```bash
     git clone <repository-url>
-    cd rust_lra_calculator
+    cd LRA-Calculator-Rust
     ```
 
 2.  **构建项目**:
@@ -29,14 +29,14 @@
     ```bash
     cargo build --release
     ```
-    编译后的可执行文件将位于 `./target/release/rust_lra_calculator`。
+    编译后的可执行文件将位于 `./target/release/LRA-Calculator-Rust`。
 
 ## 使用方法
 
 1.  **运行程序**:
     直接运行编译好的可执行文件。
     ```bash
-    ./target/release/rust_lra_calculator
+    ./target/release/LRA-Calculator-Rust
     ```
 
 2.  **输入路径**:
