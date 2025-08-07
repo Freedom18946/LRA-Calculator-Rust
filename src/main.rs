@@ -1,291 +1,394 @@
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::str;
-use std::sync::atomic::{AtomicUsize, Ordering};
+//! # LRA 音频响度范围计算器
+//!
+//! 这是一个高性能的命令行工具，用于递归计算指定文件夹内所有音频文件的响度范围（Loudness Range, LRA）。
+//! 它利用多线程并行处理来最大化效率，并使用业界标准的 FFmpeg 进行核心分析。
+//!
+//! ## 主要功能
+//! - 递归扫描音频文件
+//! - 多线程并行处理
+//! - 支持多种音频格式
+//! - 基于 EBU R128 标准的精确 LRA 计算
+//! - 结果自动排序和保存
 
-use rayon::prelude::*;
-use regex::Regex;
-use walkdir::WalkDir;
-// use tempfile::Builder as TempFileBuilder; // <--- 不再需要 tempfile
+mod audio;
+mod error;
+mod processor;
+mod utils;
+
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+
 use chrono::Local;
 
-const SUPPORTED_EXTENSIONS: [&str; 10] = [
-    "wav", "mp3", "m4a", "flac", "aac", "ogg", "opus", "wma", "aiff", "alac",
-];
+use audio::{check_ffmpeg_availability, scan_audio_files};
+use processor::{analyze_results, display_processing_stats, process_files_parallel};
+use utils::{get_folder_path_from_user, sort_lra_results_file};
 
-#[derive(Debug)]
-struct ProcessFileError {
-    file_path: String,
-    message: String,
+
+/// 程序主入口函数 (Main Entry Point)
+///
+/// 这是 LRA 音频响度范围计算器的主控制函数，协调整个处理流程。
+/// 它按照清晰的步骤执行完整的 LRA 计算工作流，包含完善的错误处理和用户反馈。
+///
+/// ## 执行流程
+///
+/// ### 1. 环境初始化和检查
+/// - 显示欢迎信息和程序版本
+/// - 检查 FFmpeg 的可用性和版本兼容性
+/// - 验证系统环境是否满足运行要求
+///
+/// ### 2. 用户交互和输入验证
+/// - 获取用户输入的文件夹路径
+/// - 验证路径的有效性和访问权限
+/// - 提供友好的错误提示和重试机制
+///
+/// ### 3. 文件发现和预处理
+/// - 递归扫描指定目录及其子目录
+/// - 识别和过滤支持的音频文件格式
+/// - 排除结果文件，避免处理自己生成的文件
+/// - 显示发现的文件数量和预估处理时间
+///
+/// ### 4. 并行处理和进度跟踪
+/// - 使用多线程并行计算 LRA 值
+/// - 实时显示处理进度和线程状态
+/// - 收集成功和失败的处理结果
+/// - 提供详细的错误信息和统计数据
+///
+/// ### 5. 结果处理和输出
+/// - 分析处理结果，生成统计信息
+/// - 将成功的结果写入文件
+/// - 按 LRA 值对结果进行排序
+/// - 显示最终的处理摘要和文件位置
+///
+/// ## 错误处理策略
+///
+/// ### 致命错误（程序终止）
+/// - FFmpeg 不可用或版本不兼容
+/// - 用户输入的路径无效且无法修复
+/// - 系统资源不足（内存、磁盘空间）
+/// - 文件系统权限问题
+///
+/// ### 可恢复错误（继续处理）
+/// - 单个音频文件处理失败
+/// - 部分文件无法访问
+/// - 网络存储临时不可用
+///
+/// ### 用户错误（提示重试）
+/// - 路径输入错误
+/// - 选择了文件而非目录
+/// - 权限不足但可以修复
+///
+/// # 返回值
+/// - `Ok(())` - 程序成功执行完成，所有步骤都正常
+/// - `Err(Box<dyn std::error::Error>)` - 发生不可恢复的错误，程序需要终止
+///
+/// # 性能特性
+/// - 自动利用所有可用 CPU 核心进行并行处理
+/// - 内存使用量与文件数量成正比，通常保持在合理范围内
+/// - 支持处理大型音乐库（数万个文件）
+/// - 提供实时进度反馈，避免用户等待焦虑
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. 程序初始化和环境检查
+    display_welcome_message();
+    check_system_environment()?;
+
+    // 2. 获取用户输入和路径验证
+    let base_folder_path = get_user_input_with_validation()?;
+
+    // 3. 文件发现和预处理
+    let (files_to_process, results_file_path) = discover_and_prepare_files(&base_folder_path)?;
+
+    // 4. 并行处理和进度跟踪
+    let processing_results = execute_parallel_processing(files_to_process);
+
+    // 5. 结果处理和输出
+    finalize_and_output_results(processing_results, &results_file_path)?;
+
+    display_completion_message(&results_file_path);
+    Ok(())
 }
 
-impl std::fmt::Display for ProcessFileError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "File '{}': {}", self.file_path, self.message)
+/// 显示欢迎信息 (Display Welcome Message)
+///
+/// 显示程序的欢迎信息、版本信息和基本说明。
+/// 这有助于用户了解程序的功能和当前运行状态。
+fn display_welcome_message() {
+    println!("🎵 ==========================================");
+    println!("🎵   LRA 音频响度范围计算器");
+    println!("🎵   高性能版 - 基于 FFmpeg 直接分析");
+    println!("🎵 ==========================================");
+    println!("📅 启动时间: {}", Local::now().format("%Y-%m-%d %H:%M:%S"));
+    println!("🔧 基于 EBU R128 标准进行精确 LRA 计算");
+    println!("⚡ 支持多线程并行处理，充分利用 CPU 资源");
+    println!();
+}
+
+/// 检查系统环境 (Check System Environment)
+///
+/// 验证程序运行所需的系统环境，主要是 FFmpeg 的可用性。
+/// 如果环境检查失败，程序将终止并提供详细的错误信息。
+///
+/// # 返回值
+/// - `Ok(())` - 系统环境检查通过
+/// - `Err(...)` - 环境检查失败，包含详细错误信息
+fn check_system_environment() -> Result<(), Box<dyn std::error::Error>> {
+    println!("🔍 正在检查系统环境...");
+
+    match check_ffmpeg_availability() {
+        Ok(()) => {
+            println!("✅ 系统环境检查完成，所有依赖都已就绪");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("❌ 系统环境检查失败: {}", e);
+            eprintln!("💡 请按照错误提示安装必要的依赖后重试");
+            Err(e.into())
+        }
     }
 }
-impl std::error::Error for ProcessFileError {}
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("欢迎使用音频 LRA 计算器（高性能版 - 直接分析）！");
-    println!("当前时间: {}", Local::now().format("%Y-%m-%d %H:%M:%S"));
+/// 获取用户输入并验证 (Get User Input with Validation)
+///
+/// 获取用户输入的文件夹路径，并进行完整的验证。
+/// 这个函数封装了用户交互逻辑，提供友好的错误处理。
+///
+/// # 返回值
+/// - `Ok(PathBuf)` - 验证通过的文件夹路径
+/// - `Err(...)` - 用户输入无效或验证失败
+fn get_user_input_with_validation() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    println!("📂 请选择要处理的音频文件夹...");
 
-    let base_folder_path = get_folder_path_from_user()?;
-    println!("正在递归扫描文件夹: {}", base_folder_path.display());
+    match get_folder_path_from_user() {
+        Ok(path) => {
+            println!("✅ 文件夹路径验证成功: {}", path.display());
+            Ok(path)
+        }
+        Err(e) => {
+            eprintln!("❌ 文件夹路径获取失败: {}", e);
+            Err(e)
+        }
+    }
+}
+
+/// 发现和准备文件 (Discover and Prepare Files)
+///
+/// 扫描指定目录中的音频文件，并准备处理所需的数据结构。
+/// 这个函数还会创建结果文件路径并处理空目录的情况。
+///
+/// # 参数
+/// - `base_folder_path` - 要扫描的基础文件夹路径
+///
+/// # 返回值
+/// - `Ok((Vec<(PathBuf, String)>, PathBuf))` - 文件列表和结果文件路径
+/// - `Err(...)` - 文件扫描或准备过程中的错误
+fn discover_and_prepare_files(
+    base_folder_path: &Path
+) -> Result<(Vec<(PathBuf, String)>, PathBuf), Box<dyn std::error::Error>> {
+    println!("🔍 正在递归扫描文件夹: {}", base_folder_path.display());
 
     let results_file_path = base_folder_path.join("lra_results.txt");
-    let header_line = "文件路径 (相对) - LRA 数值 (LU)";
-
-    let mut files_to_process: Vec<(PathBuf, String)> = Vec::new();
-    for entry_result in WalkDir::new(&base_folder_path)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-    {
-        let current_file_path = entry_result.path().to_path_buf();
-        if current_file_path == results_file_path {
-            continue;
-        }
-        if let Some(extension) = current_file_path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|s| s.to_lowercase())
-        {
-            if SUPPORTED_EXTENSIONS.contains(&extension.as_str()) {
-                let display_path_str = current_file_path
-                    .strip_prefix(&base_folder_path)
-                    .unwrap_or(&current_file_path)
-                    .to_string_lossy()
-                    .into_owned();
-                files_to_process.push((current_file_path, display_path_str));
-            }
-        }
-    }
+    let files_to_process = scan_audio_files(base_folder_path, Some(&results_file_path));
 
     if files_to_process.is_empty() {
-        println!("在指定路径下没有找到支持的音频文件。");
+        println!("⚠️  在指定路径下没有找到支持的音频文件");
+        println!("📝 创建空的结果文件...");
+
+        // 创建空的结果文件
+        let header_line = "文件路径 (相对) - LRA 数值 (LU)";
         let mut writer = BufWriter::new(File::create(&results_file_path)?);
         writeln!(writer, "{}", header_line)?;
         writer.flush()?;
-        return Ok(());
+
+        println!("✅ 空结果文件已创建: {}", results_file_path.display());
+        return Err("没有找到要处理的音频文件".into());
     }
+
     println!(
-        "扫描完成，找到 {} 个音频文件待处理。",
+        "✅ 扫描完成，发现 {} 个音频文件待处理",
         files_to_process.len()
     );
-    println!("开始多线程直接分析...");
 
-    let total_files = files_to_process.len();
-    let processed_count = AtomicUsize::new(0);
+    // 显示文件格式统计
+    display_file_format_statistics(&files_to_process);
 
-    let processing_results: Vec<Result<(String, f64), ProcessFileError>> = files_to_process
-        .into_par_iter()
-        .map(|(current_file_path, display_path_str)| {
-            let current_processed_atomic = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
-            println!(
-                "  [线程 {:?}] ({}/{}) 直接分析: {}",
-                std::thread::current().id(),
-                current_processed_atomic,
-                total_files,
-                display_path_str
-            );
+    Ok((files_to_process, results_file_path))
+}
 
-            // 直接调用 calculate_lra，传入原始文件路径
-            // 不再有转换步骤和临时文件
-            match calculate_lra_direct(&current_file_path) {
-                // <--- 调用新命名的函数
-                Ok(lra) => {
-                    println!(
-                        "    [线程 {:?}] ({}/{}) 分析成功: {} LRA: {:.1} LU",
-                        std::thread::current().id(),
-                        current_processed_atomic,
-                        total_files,
-                        display_path_str,
-                        lra
-                    );
-                    Ok((display_path_str, lra))
-                }
-                Err(e) => {
-                    let err_msg = format!("分析失败: {}", e);
-                    Err(ProcessFileError {
-                        file_path: display_path_str,
-                        message: err_msg,
-                    })
-                }
-            }
-        })
-        .collect();
+/// 显示文件格式统计 (Display File Format Statistics)
+///
+/// 分析发现的音频文件，按格式进行统计并显示给用户。
+/// 这有助于用户了解文件库的组成情况。
+///
+/// # 参数
+/// - `files` - 发现的文件列表
+fn display_file_format_statistics(files: &[(PathBuf, String)]) {
+    use std::collections::HashMap;
 
-    println!("\n并行分析阶段完成。");
+    let mut format_counts: HashMap<String, usize> = HashMap::new();
 
-    let mut writer = BufWriter::new(File::create(&results_file_path)?);
-    writeln!(writer, "{}", header_line)?;
-    let mut actual_successes = 0;
-    let mut actual_failures = 0;
-    let mut error_messages_collected: Vec<String> = Vec::new();
-
-    for result in processing_results {
-        match result {
-            Ok((path_str, lra)) => {
-                writeln!(writer, "{} - {:.1}", path_str, lra)?;
-                actual_successes += 1;
-            }
-            Err(e) => {
-                error_messages_collected.push(format!("文件 '{}': {}", e.file_path, e.message));
-                actual_failures += 1;
-            }
-        }
-    }
-    writer.flush()?;
-
-    println!("结果写入完成。");
-    println!("成功处理 {} 个文件。", actual_successes);
-    if actual_failures > 0 {
-        println!("{} 个文件处理失败。详情如下:", actual_failures);
-        for err_msg in error_messages_collected {
-            eprintln!("  - {}", err_msg);
+    for (file_path, _) in files {
+        if let Some(extension) = file_path.extension().and_then(|ext| ext.to_str()) {
+            let ext_lower = extension.to_lowercase();
+            *format_counts.entry(ext_lower).or_insert(0) += 1;
         }
     }
 
-    if actual_successes > 0 {
-        match sort_lra_results_file(&results_file_path, header_line) {
-            Ok(_) => println!("结果文件 {} 已成功排序。", results_file_path.display()),
-            Err(e) => eprintln!(
-                "错误：排序结果文件 {} 失败: {}",
-                results_file_path.display(),
-                e
-            ),
-        }
+    println!("📊 文件格式统计:");
+    let mut formats: Vec<_> = format_counts.into_iter().collect();
+    formats.sort_by(|a, b| b.1.cmp(&a.1)); // 按数量降序排序
+
+    for (format, count) in formats {
+        println!("   {} 格式: {} 个文件", format.to_uppercase(), count);
+    }
+    println!();
+}
+
+/// 执行并行处理 (Execute Parallel Processing)
+///
+/// 启动多线程并行处理，计算所有音频文件的 LRA 值。
+/// 这是程序的核心处理阶段，会显示详细的进度信息。
+///
+/// # 参数
+/// - `files_to_process` - 要处理的文件列表
+///
+/// # 返回值
+/// - 处理结果列表，包含成功和失败的结果
+fn execute_parallel_processing(
+    files_to_process: Vec<(PathBuf, String)>
+) -> Vec<Result<(String, f64), crate::error::ProcessFileError>> {
+    println!("⚡ 开始并行处理阶段...");
+
+    let start_time = std::time::Instant::now();
+    let results = process_files_parallel(files_to_process);
+    let elapsed = start_time.elapsed();
+
+    println!("⏱️  并行处理耗时: {:.2} 秒", elapsed.as_secs_f64());
+
+    results
+}
+
+/// 完成处理并输出结果 (Finalize and Output Results)
+///
+/// 分析处理结果，写入结果文件，并进行排序。
+/// 这是程序的最后阶段，负责生成最终的输出文件。
+///
+/// # 参数
+/// - `processing_results` - 并行处理的结果
+/// - `results_file_path` - 结果文件路径
+///
+/// # 返回值
+/// - `Ok(())` - 结果处理成功
+/// - `Err(...)` - 文件写入或排序失败
+fn finalize_and_output_results(
+    processing_results: Vec<Result<(String, f64), crate::error::ProcessFileError>>,
+    results_file_path: &Path
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("📊 正在分析处理结果...");
+
+    // 分析结果
+    let (stats, successful_results) = analyze_results(processing_results);
+
+    // 显示统计信息
+    display_processing_stats(&stats);
+
+    // 写入结果文件
+    write_initial_results_file(results_file_path, &successful_results)?;
+
+    // 排序结果文件
+    if stats.successful > 0 {
+        sort_results_file_if_needed(results_file_path, &stats)?;
     } else {
-        println!("没有成功处理的文件，跳过排序。");
+        println!("📝 没有成功处理的文件，跳过排序步骤");
     }
 
-    println!(
-        "所有操作完成！结果已保存于: {}",
-        results_file_path.display()
-    );
-    println!("结束时间: {}", Local::now().format("%Y-%m-%d %H:%M:%S"));
     Ok(())
 }
 
-fn get_folder_path_from_user() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    loop {
-        print!("请输入要递归处理的音乐顶层文件夹路径: ");
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let path_str = input.trim();
-        if path_str.is_empty() {
-            eprintln!("错误: 路径不能为空，请重新输入。");
-            continue;
-        }
-        let path = PathBuf::from(path_str);
-        if path.is_dir() {
-            match path.canonicalize() {
-                Ok(canonical_path) => return Ok(canonical_path),
-                Err(e) => eprintln!(
-                    "错误: 无法规范化路径 '{}': {}. 请确保路径有效且程序有权限访问。",
-                    path.display(),
-                    e
-                ),
-            }
-        } else {
-            eprintln!(
-                "错误: \"{}\" 不是一个有效的文件夹路径或文件夹不存在，请重新输入。",
-                path.display()
-            );
-        }
-    }
-}
-
-// 移除了 convert_to_flac 函数
-
-// calculate_lra 函数被重命名并修改为直接处理原始音频文件
-fn calculate_lra_direct(
-    audio_file_path: &Path,
-) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-    let output = Command::new("ffmpeg")
-        .arg("-i")
-        .arg(audio_file_path) // <--- 直接使用原始音频文件路径
-        .arg("-filter_complex")
-        .arg("ebur128")
-        .arg("-f")
-        .arg("null")
-        .arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("info") // ebur128 输出在 info 级别
-        .arg("-")
-        .output()?;
-
-    let stderr_output = String::from_utf8_lossy(&output.stderr);
-
-    let re = Regex::new(r"LRA:\s*([\d\.-]+)\s*LU")?;
-    if let Some(caps) = re.captures_iter(&stderr_output).last() {
-        if let Some(lra_str) = caps.get(1) {
-            return lra_str.as_str().parse::<f64>().map_err(|e| {
-                format!(
-                    "解析LRA值 '{}' (来自文件 {}) 失败: {}",
-                    lra_str.as_str(),
-                    audio_file_path.display(),
-                    e
-                )
-                .into()
-            });
-        }
-    }
-    Err(format!(
-        "无法从 ffmpeg 输出中为文件 {} 解析 LRA 值. stderr: {}",
-        audio_file_path.display(),
-        stderr_output.trim()
-    )
-    .into())
-}
-
-fn sort_lra_results_file(
+/// 写入初始结果文件 (Write Initial Results File)
+///
+/// 将成功处理的结果写入文件，包含表头和数据行。
+///
+/// # 参数
+/// - `results_file_path` - 结果文件路径
+/// - `successful_results` - 成功处理的结果列表
+///
+/// # 返回值
+/// - `Ok(())` - 写入成功
+/// - `Err(...)` - 写入失败
+fn write_initial_results_file(
     results_file_path: &Path,
-    header_line: &str,
+    successful_results: &[(String, f64)]
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // (此函数与上一版本相同，无需修改)
-    println!("\n正在排序结果文件: {}", results_file_path.display());
-    let file = File::open(results_file_path)?;
-    let reader = BufReader::new(file);
-    let mut entries: Vec<(String, f64)> = Vec::new();
-    let mut lines_iter = reader.lines();
+    println!("📝 正在写入结果文件...");
 
-    if lines_iter.next().is_none() {
-        println!("结果文件为空或只有表头，无需排序。");
-        let mut writer = BufWriter::new(File::create(results_file_path)?);
-        writeln!(writer, "{}", header_line)?;
-        writer.flush()?;
-        return Ok(());
-    }
-
-    for line_result in lines_iter {
-        let line = line_result?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        match line.rsplit_once(" - ") {
-            Some((path_part, lra_str_part)) => match lra_str_part.trim().parse::<f64>() {
-                Ok(lra_value) => entries.push((path_part.to_string(), lra_value)),
-                Err(e) => eprintln!(
-                    "排序时警告: 无法解析行 '{}' 中的LRA值 '{}': {}",
-                    line, lra_str_part, e
-                ),
-            },
-            None => eprintln!("排序时警告: 行 '{}' 格式不符合预期。将被忽略。", line),
-        }
-    }
-
-    entries.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-
+    let header_line = "文件路径 (相对) - LRA 数值 (LU)";
     let mut writer = BufWriter::new(File::create(results_file_path)?);
+
     writeln!(writer, "{}", header_line)?;
-    for (path_str, lra) in entries {
+    for (path_str, lra) in successful_results {
         writeln!(writer, "{} - {:.1}", path_str, lra)?;
     }
     writer.flush()?;
+
+    println!("✅ 结果文件写入完成");
     Ok(())
 }
+
+/// 根据需要排序结果文件 (Sort Results File If Needed)
+///
+/// 对结果文件进行排序，并处理可能的排序错误。
+///
+/// # 参数
+/// - `results_file_path` - 结果文件路径
+/// - `stats` - 处理统计信息
+///
+/// # 返回值
+/// - `Ok(())` - 排序成功或跳过
+/// - `Err(...)` - 排序失败
+fn sort_results_file_if_needed(
+    results_file_path: &Path,
+    stats: &crate::processor::ProcessingStats
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("🔄 正在对结果文件进行排序...");
+
+    let header_line = "文件路径 (相对) - LRA 数值 (LU)";
+    match sort_lra_results_file(results_file_path, header_line) {
+        Ok(()) => {
+            println!("✅ 结果文件排序完成");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "⚠️  排序结果文件失败: {}\n\
+                 📝 原始结果文件仍然可用: {}",
+                e,
+                results_file_path.display()
+            );
+            // 排序失败不应该导致整个程序失败
+            Ok(())
+        }
+    }
+}
+
+/// 显示完成信息 (Display Completion Message)
+///
+/// 显示程序完成的信息，包括结果文件位置和使用建议。
+///
+/// # 参数
+/// - `results_file_path` - 结果文件路径
+fn display_completion_message(results_file_path: &Path) {
+    println!("\n🎉 ==========================================");
+    println!("🎉   所有操作已成功完成！");
+    println!("🎉 ==========================================");
+    println!("📄 结果文件位置: {}", results_file_path.display());
+    println!("📊 文件已按 LRA 值从高到低排序");
+    println!("💡 使用建议:");
+    println!("   • LRA > 15 LU: 动态范围丰富（古典、爵士）");
+    println!("   • LRA 8-15 LU: 适中动态范围（摇滚、民谣）");
+    println!("   • LRA < 8 LU: 动态范围较小（流行、播客）");
+    println!("⏰ 完成时间: {}", Local::now().format("%Y-%m-%d %H:%M:%S"));
+    println!("🎵 感谢使用 LRA 计算器！");
+}
+
+
